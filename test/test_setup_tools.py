@@ -24,29 +24,38 @@ def test_parse_requirements_happy_file():
     """Make sure that parse_requirements correctly parses requirements for a
     library with multiple tracked modules
     """
-    with tempfile.NamedTemporaryFile("w") as requirements_file:
+    # NOTE: delete=False is required on Windows where an open
+    # NamedTemporaryFile cannot be re-opened for reading by name.
+    requirements_file = tempfile.NamedTemporaryFile(
+        "w", suffix=".txt", delete=False
+    )
+    requirements_path = requirements_file.name
+    try:
         # Make a requirements file that looks normal
         requirements_file.write("\n".join(sample_lib_requirements))
         requirements_file.flush()
+        requirements_file.close()
 
         # Parse the reqs for "sample_lib"
         requirements, extras_require = parse_requirements(
-            requirements_file.name,
+            requirements_path,
             "sample_lib",
         )
+    finally:
+        os.remove(requirements_path)
 
-        # Make sure the right parsing happened
-        assert requirements == ["import-tracker"]
-        assert extras_require == {
-            "sample_lib.nested.submod3": sorted(
-                ["PyYaml >= 6.0", "alchemy-logging>=1.0.3"]
-            ),
-            "sample_lib.nested": sorted(["PyYaml >= 6.0", "alchemy-logging>=1.0.3"]),
-            "sample_lib.submod1": sorted(["conditional_deps"]),
-            "sample_lib.submod2": sorted(["alchemy-logging>=1.0.3"]),
-            "sample_lib": sorted(set(sample_lib_requirements) - {"import-tracker"}),
-            "all": sorted(sample_lib_requirements),
-        }
+    # Make sure the right parsing happened
+    assert requirements == ["import-tracker"]
+    assert extras_require == {
+        "sample_lib.nested.submod3": sorted(
+            ["PyYaml >= 6.0", "alchemy-logging>=1.0.3"]
+        ),
+        "sample_lib.nested": sorted(["PyYaml >= 6.0", "alchemy-logging>=1.0.3"]),
+        "sample_lib.submod1": sorted(["conditional_deps"]),
+        "sample_lib.submod2": sorted(["alchemy-logging>=1.0.3"]),
+        "sample_lib": sorted(set(sample_lib_requirements) - {"import-tracker"}),
+        "all": sorted(sample_lib_requirements),
+    }
 
 
 @pytest.mark.parametrize("iterable_type", [list, tuple, set])

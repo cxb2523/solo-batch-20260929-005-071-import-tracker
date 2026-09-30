@@ -272,12 +272,21 @@ class Bar:
         self.val = val + 1
 """
             )
+        # NOTE: Use a list-form argv and inherit the current environment (with
+        # PYTHONPATH augmented) so this works on Windows where shlex.split does
+        # not understand quoted command lines and the executable path may
+        # contain spaces.
+        child_env = dict(os.environ)
+        child_env["PYTHONPATH"] = workdir
         out, _ = subprocess.Popen(
-            shlex.split(
-                f"{sys.executable} -c 'from some_module import Foo; import pickle; print(pickle.dumps(Foo()).hex())'"
-            ),
+            [
+                sys.executable,
+                "-c",
+                "from some_module import Foo; import pickle; "
+                "print(pickle.dumps(Foo()).hex())",
+            ],
             stdout=subprocess.PIPE,
-            env={"PYTHONPATH": workdir},
+            env=child_env,
         ).communicate()
 
     # Import the missing module

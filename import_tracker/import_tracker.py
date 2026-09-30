@@ -427,6 +427,30 @@ def _figure_out_import(
     return sys.modules.get(import_name)
 
 
+def _get_except_ranges_from_table(exception_table, instructions_by_offset):
+    """Build the list of bytecode offset ranges that cover the body of a
+    try/except block.
+
+    Entries whose handler begins with ``PUSH_EXC_INFO`` correspond to
+    try/except blocks (imports within them are optional). try/finally handlers
+    do not begin with ``PUSH_EXC_INFO`` and must not cause an import to be
+    treated as optional.
+    """
+    except_ranges = []
+    for entry in exception_table:
+        if getattr(entry, "depth", 0) != 0:
+            continue
+        handler = instructions_by_offset.get(entry.target)
+        if handler is not None and handler.opname == "PUSH_EXC_INFO":
+            except_ranges.append((entry.start, entry.end))
+    return except_ranges
+
+
+def _in_except_range(offset, except_ranges):
+    """Return whether the given offset falls within a try/except body"""
+    return any(start <= offset < end for start, end in except_ranges)
+
+
 def _get_imports(mod: ModuleType) -> Tuple[Set[ModuleType], Set[ModuleType]]:
     """Get the sets of required and optional imports for the given module by
     parsing its bytecode
@@ -446,6 +470,98 @@ def _get_imports(mod: ModuleType) -> Tuple[Set[ModuleType], Set[ModuleType]]:
     if mod_code is None:
         log.debug2("No code object found for %s", mod.__name__)
         return req_imports, opt_imports
+
+    # Python 3.11+ exposes a structured exception table. This path also handles
+    # the changed bytecode/dis formatting introduced in 3.14 (e.g.
+    # LOAD_SMALL_INT and label-based exception tables).
+    parse_exception_table = getattr(dis, "_parse_exception_table", None)
+    if parse_exception_table is not None:
+        instructions = list(dis.get_instructions(mod_code))
+        log.debug4("Byte Code:")
+        for instruction in instructions:
+            log.debug4(instruction)
+        instructions_by_offset = {
+            instruction.offset: instruction for instruction in instructions
+        }
+        try:
+            except_ranges = _get_except_ranges_from_table(
+                parse_exception_table(mod_code),
+                instructions_by_offset,
+            )
+        except Exception:  # pragma: no cover - defensive against internals churn
+            log.warning("Could not parse exception table for %s", mod.__name__)
+            except_ranges = []
+        log.debug4("Except ranges: %s", except_ranges)
+
+        current_dots = None
+        current_import_name = None
+        current_import_from = None
+        current_import_offset = None
+        open_import = False
+        for instruction in instructions:
+            if instruction.opname in ("LOAD_CONST", "LOAD_SMALL_INT"):
+                if isinstance(instruction.argval, int):
+                    current_dots = instruction.argval
+            elif instruction.opname == "IMPORT_NAME":
+                open_import = True
+                current_import_name = instruction.argval
+                current_import_offset = instruction.offset
+            elif instruction.opname == "IMPORT_FROM":
+                open_import = True
+                current_import_from = instruction.argval
+            else:
+                # This closes an import, so figure out what the module is that
+                # is being imported!
+                if open_import:
+                    import_mod = _figure_out_import(
+                        mod, current_dots, current_import_name, current_import_from
+                    )
+                    if import_mod is not None:
+                        log.debug2("Adding import module [%s]", import_mod.__name__)
+                        if _in_except_range(current_import_offset, except_ranges):
+                            log.debug(
+                                "Found optional dependency of [%s]: %s",
+                                mod.__name__,
+                                import_mod.__name__,
+                            )
+                            opt_imports.add(import_mod)
+                        else:
+                            req_imports.add(import_mod)
+
+                # If this is a STORE_NAME, subsequent "from" statements may use
+                # the same dots and name
+                if instruction.opname != "STORE_NAME":
+                    current_dots = None
+                    current_import_name = None
+                open_import = False
+                current_import_from = None
+
+        # To the best of our knowledge, all bytecode will end with something
+        # other than an import, even if an import is the last line in the file
+        # (e.g. STORE_NAME). If this somehow proves to be untrue, please file a
+        # bug!
+        assert not open_import, "Found an unclosed import in {}! {}/{}/{}".format(
+            mod.__name__,
+            current_dots,
+            current_import_name,
+            current_import_from,
+        )
+        return req_imports, opt_imports
+
+    return _get_imports_from_dis_text(mod, mod_code)
+
+
+def _get_imports_from_dis_text(
+    mod: ModuleType, mod_code
+) -> Tuple[Set[ModuleType], Set[ModuleType]]:
+    """Get the sets of required and optional imports for the given module by
+    parsing the text ``dis`` output.
+
+    This legacy path supports Python versions prior to 3.11 that do not expose
+    a structured exception table.
+    """
+    req_imports = set()
+    opt_imports = set()
     bcode = dis.Bytecode(mod_code)
 
     # Parse all bytecode lines
@@ -515,7 +631,7 @@ def _get_imports(mod: ModuleType) -> Tuple[Set[ModuleType], Set[ModuleType]]:
             open_tries.remove(op_num)
             log.debug3("Closed try %d. Remaining open tries: %s", op_num, open_tries)
 
-    # To the best of my knowledge, all bytecode will end with something other
+    # To the best of our knowledge, all bytecode will end with something other
     # than an import, even if an import is the last line in the file (e.g.
     # STORE_NAME). If this somehow proves to be untrue, please file a bug!
     assert not open_import, "Found an unclosed import in {}! {}/{}/{}".format(
@@ -526,6 +642,7 @@ def _get_imports(mod: ModuleType) -> Tuple[Set[ModuleType], Set[ModuleType]]:
     )
 
     return req_imports, opt_imports
+
 
 
 def _find_parent_direct_deps(
