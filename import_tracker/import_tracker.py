@@ -5,10 +5,10 @@ through import statements
 # Standard
 from types import ModuleType
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+import ast
 import dis
 import importlib
 import os
-import re
 import sys
 
 # Local
@@ -268,10 +268,6 @@ _known_std_pkgs = [
 ]
 
 
-# Regex for matching lines in the exception table
-_exception_table_expr = re.compile(r"  ([0-9]+) to ([0-9]+) -> [0-9]+ \[([0-9]+)\].*")
-
-
 def _mod_defined_in_init_file(mod: ModuleType) -> bool:
     """Determine if the given module is defined in an __init__.py[c]"""
     mod_file = getattr(mod, "__file__", None)
@@ -317,58 +313,73 @@ def _get_non_std_modules(mod_names: Iterable[str]) -> Set[str]:
     return {mod_name for mod_name in mod_names if _is_third_party(mod_name)}
 
 
-def _get_value_col(dis_line: str) -> str:
-    """Parse the string value from a `dis` output line"""
-    loc = dis_line.find("(")
-    if loc >= 0:
-        return dis_line[loc + 1 : -1]
-    return ""
+def _get_optional_import_lines(mod: ModuleType) -> Set[int]:
+    """Get the set of source line numbers that hold "optional" imports
 
-
-def _get_op_number(dis_line: str) -> Optional[int]:
-    """Get the opcode number out of the line of `dis` output"""
-    line_parts = dis_line.split()
-    valid_line_part_idxs = [i for i, val in enumerate(line_parts) if val.isupper()]
-    if not valid_line_part_idxs:
-        return None
-    opcode_idx = min(valid_line_part_idxs)
-    assert opcode_idx > 0, f"Opcode found at the beginning of line! [{dis_line}]"
-    return int(line_parts[opcode_idx - 1])
-
-
-def _get_try_end_number(
-    dis_line: str,
-    op_num: Optional[int],
-    exception_table: Dict[int, int],
-) -> Optional[int]:
-    """If the line contains a known indicator for a try block, get the
-    corresponding end number
-
-    NOTE: This contains compatibility code for changes between 3.10 and 3.11
+    An import is considered optional when it is executed in the body of a
+    ``try`` block that has one or more ``except`` handlers. This mirrors the
+    bytecode-based detection (an exception table entry that jumps to a handler)
+    used historically, but reads the information from the AST so that it is
+    robust to changes in ``dis`` output formatting across Python versions.
     """
-    return exception_table.get(op_num or -1) or (
-        int(_get_value_col(dis_line).split()[-1])
-        if any(op in dis_line for op in ["SETUP_FINALLY", "SETUP_EXCEPT"])
-        else None
-    )
+    loader = getattr(mod, "__loader__", None)
+    source = None
+    if loader is not None and hasattr(loader, "get_source"):
+        try:
+            source = loader.get_source(mod.__name__)
+        except (ImportError, SyntaxError):
+            source = None
+    if source is None:
+        mod_file = getattr(mod, "__file__", None)
+        if mod_file is not None and os.path.splitext(mod_file)[1] == ".py":
+            try:
+                with open(mod_file, "r", encoding="utf-8") as handle:
+                    source = handle.read()
+            except OSError:
+                source = None
+    if source is None:
+        return set()
+
+    if not source:
+        return set()
+    try:
+        tree = ast.parse(source, filename=getattr(mod, "__file__", "<module>"))
+    except SyntaxError:
+        return set()
+
+    optional_lines = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try) or not node.handlers:
+            continue
+
+        # A ``try`` without a ``finally`` ends its protected range at the end
+        # of its body. With a ``finally``, the bytecode protects both the body
+        # and the handlers up through the end of the finally block, so include
+        # them here as well to match historical detection.
+        last_line = max(
+            [_node_end_line(part) for part in node.body] + [node.lineno]
+        )
+        if node.finalbody:
+            last_line = max(
+                [last_line] + [_node_end_line(part) for part in node.finalbody]
+            )
+        optional_lines.update(range(node.lineno, last_line + 1))
+    return optional_lines
 
 
-def _get_exception_table(dis_lines: List[str]) -> Dict[int, int]:
-    """For 3.11+ exception handling, parse the Exception Table"""
-    table_start = [i for i, line in enumerate(dis_lines) if line == "ExceptionTable:"]
-    assert len(table_start) <= 1, "Found multiple exception tables!"
-    return (
-        {
-            int(m.group(1)): int(m.group(2))
-            for m in [
-                _exception_table_expr.match(line)
-                for line in dis_lines[table_start[0] + 1 :]
-            ]
-            if m and int(m.group(3)) == 0 and m.group(1) != m.group(2)
-        }
-        if table_start
-        else {}
-    )
+def _node_end_line(node: ast.AST) -> int:
+    """Get the last source line covered by an AST node, falling back to its
+    starting line if no end line information is available
+    """
+    end_line = getattr(node, "end_lineno", None)
+    if end_line is not None:
+        return end_line
+    children = [
+        child for child in ast.iter_child_nodes(node) if hasattr(child, "lineno")
+    ]
+    if not children:
+        return getattr(node, "lineno", 0)
+    return max(_node_end_line(child) for child in children)
 
 
 def _figure_out_import(
@@ -427,13 +438,31 @@ def _figure_out_import(
     return sys.modules.get(import_name)
 
 
+def _instruction_line_number(instr: "dis.Instruction") -> Optional[int]:
+    """Get the source line number for a bytecode instruction
+
+    On Python 3.14+ the line number is available as ``line_number`` and
+    ``starts_line`` became a simple boolean flag. On older versions
+    ``starts_line`` itself holds the line number.
+    """
+    line_number = getattr(instr, "line_number", None)
+    if isinstance(line_number, int):
+        return line_number
+    starts_line = getattr(instr, "starts_line", None)
+    return starts_line if isinstance(starts_line, int) else None
+
+
 def _get_imports(mod: ModuleType) -> Tuple[Set[ModuleType], Set[ModuleType]]:
     """Get the sets of required and optional imports for the given module by
-    parsing its bytecode
+    walking its bytecode instructions
     """
     log.debug2("Getting imports for %s", mod.__name__)
     req_imports = set()
     opt_imports = set()
+
+    # Determine which source lines hold imports inside of try/except blocks
+    optional_lines = _get_optional_import_lines(mod)
+    log.debug3("Optional import lines for [%s]: %s", mod.__name__, optional_lines)
 
     # Attempt to disassemble the byte code for this module. If the module has no
     # code, we ignore it since it's most likely a c extension
@@ -446,43 +475,32 @@ def _get_imports(mod: ModuleType) -> Tuple[Set[ModuleType], Set[ModuleType]]:
     if mod_code is None:
         log.debug2("No code object found for %s", mod.__name__)
         return req_imports, opt_imports
-    bcode = dis.Bytecode(mod_code)
 
-    # Parse all bytecode lines
+    # Parse the bytecode as structured instructions. This is more robust than
+    # parsing the text of `dis` output, which changes formatting between Python
+    # versions (e.g. 3.14 replaced numeric offsets with labels such as "L1").
     current_dots = None
     current_import_name = None
     current_import_from = None
     open_import = False
-    open_tries = set()
+    open_import_line = None
     log.debug4("Byte Code:")
-    dis_lines = bcode.dis().split("\n")
+    for instr in dis.Bytecode(mod_code):
+        log.debug4("%s", instr)
 
-    # Look for and parse an Exception Table (3.11+)
-    exception_table = _get_exception_table(dis_lines)
-    log.debug4("Exception Table: %s", exception_table)
-
-    for line in dis_lines:
-        log.debug4(line)
-        line_val = _get_value_col(line)
-
-        # If this is the beginning of a try block, add the end to the known open
-        # try set
-        op_num = _get_op_number(line)
-        try_end = _get_try_end_number(line, op_num, exception_table)
-        if try_end:
-            open_tries.add(try_end)
-            log.debug3("Open tries: %s", open_tries)
-
-        # Parse the individual ops
-        if "LOAD_CONST" in line:
-            if line_val.isnumeric():
-                current_dots = int(line_val)
-        elif "IMPORT_NAME" in line:
+        # The relative-import level is loaded immediately before the
+        # IMPORT_NAME. On older versions this is a LOAD_CONST holding the int,
+        # on 3.14+ it is a LOAD_SMALL_INT. Absolute imports load None here.
+        if instr.opname in ("LOAD_CONST", "LOAD_SMALL_INT"):
+            if isinstance(instr.argval, int) and not isinstance(instr.argval, bool):
+                current_dots = instr.argval
+        elif instr.opname == "IMPORT_NAME":
             open_import = True
-            current_import_name = line_val
-        elif "IMPORT_FROM" in line:
+            open_import_line = _instruction_line_number(instr)
+            current_import_name = instr.argval
+        elif instr.opname == "IMPORT_FROM":
             open_import = True
-            current_import_from = line_val
+            current_import_from = instr.argval
         else:
             # This closes an import, so figure out what the module is that is
             # being imported!
@@ -492,7 +510,7 @@ def _get_imports(mod: ModuleType) -> Tuple[Set[ModuleType], Set[ModuleType]]:
                 )
                 if import_mod is not None:
                     log.debug2("Adding import module [%s]", import_mod.__name__)
-                    if open_tries:
+                    if open_import_line in optional_lines:
                         log.debug(
                             "Found optional dependency of [%s]: %s",
                             mod.__name__,
@@ -504,16 +522,12 @@ def _get_imports(mod: ModuleType) -> Tuple[Set[ModuleType], Set[ModuleType]]:
 
             # If this is a STORE_NAME, subsequent "from" statements may use the
             # same dots and name
-            if "STORE_NAME" not in line:
+            if instr.opname != "STORE_NAME":
                 current_dots = None
                 current_import_name = None
             open_import = False
+            open_import_line = None
             current_import_from = None
-
-        # Close the open try if this ends one
-        if op_num in open_tries:
-            open_tries.remove(op_num)
-            log.debug3("Closed try %d. Remaining open tries: %s", op_num, open_tries)
 
     # To the best of my knowledge, all bytecode will end with something other
     # than an import, even if an import is the last line in the file (e.g.

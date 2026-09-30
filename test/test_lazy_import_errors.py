@@ -6,7 +6,6 @@ Tests for the lazy_import_errors functionality
 from types import ModuleType
 import os
 import pickle
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -272,12 +271,17 @@ class Bar:
         self.val = val + 1
 """
             )
+        child_env = dict(os.environ)
+        child_env["PYTHONPATH"] = workdir
         out, _ = subprocess.Popen(
-            shlex.split(
-                f"{sys.executable} -c 'from some_module import Foo; import pickle; print(pickle.dumps(Foo()).hex())'"
-            ),
+            [
+                sys.executable,
+                "-c",
+                "from some_module import Foo; import pickle; "
+                "print(pickle.dumps(Foo()).hex())",
+            ],
             stdout=subprocess.PIPE,
-            env={"PYTHONPATH": workdir},
+            env=child_env,
         ).communicate()
 
     # Import the missing module

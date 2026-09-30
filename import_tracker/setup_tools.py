@@ -328,3 +328,24 @@ def _get_required_packages_for_imports(imports: Iterable[str]) -> List[str]:
         else:
             required_pkgs.add(mod)
     return sorted(list(required_pkgs))
+
+
+# Third-party packages that only exist to build/package a distribution
+_SETUP_TOOL_PACKAGES = {
+    "setuptools",
+    "pkg_resources",
+    "wheel",
+    "pip",
+    "build",
+    "distutils",
+    "cython",
+}
+
+
+def is_setup_tool(module_name):
+    """Return whether the given module name is a packaging/setup tool
+
+    This is used by the static incremental index to keep build-time tooling
+    separate from the runtime third-party dependency classification.
+    """
+    return module_name.partition(".")[0] in _SETUP_TOOL_PACKAGES
